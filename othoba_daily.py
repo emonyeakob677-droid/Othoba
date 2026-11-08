@@ -332,11 +332,37 @@ FOOD_SLUGS = {
 }
 
 
-def discover_categories(seed=f"{BASE}/food-grocery"):
-    status, html, verdict = fetch_static(seed)
-    if verdict != OK:
-        raise RuntimeError(f"Could not load seed page ({verdict}, HTTP {status})")
+SEEDS = (f"{BASE}/food-grocery", f"{BASE}/daily-bazar")
 
+
+def _load_seed():
+    """Menu page via plain HTTP first; if that is blocked from the runner's IP,
+    fall back to headless Chrome, which gets past most bot checks."""
+    tried = []
+    for seed in SEEDS:
+        status, html, verdict = fetch_static(seed)
+        if verdict == OK:
+            return html
+        tried.append(f"{seed} static={verdict}/HTTP {status}")
+    browser = None
+    try:
+        browser = Browser()
+        for seed in SEEDS:
+            status, html, verdict = browser.get(seed)
+            if verdict == OK:
+                log(f"menu loaded via Chrome ({seed})")
+                return html
+            tried.append(f"{seed} chrome={verdict}")
+    except Exception as e:
+        tried.append(f"chrome failed to start: {type(e).__name__}: {e}")
+    finally:
+        if browser:
+            browser.close()
+    raise RuntimeError("Could not load any seed page: " + "; ".join(tried))
+
+
+def discover_categories():
+    html = _load_seed()
     soup = BeautifulSoup(html, "lxml")
     found = {}
     for nav in soup.select("ul"):
@@ -448,7 +474,22 @@ def main():
     all_rows, stats = [], {"ok": 0, "empty": 0, "gone": 0, "error": 0}
 
     def worker(chunk, wid):
-        browser = Browser()
+        # A Chrome that will not start used to raise straight out of the
+        # thread pool and abort the whole run. Retry, then count the chunk as
+        # errored so the other workers' rows are still written.
+        browser = None
+        for attempt in range(3):
+            try:
+                browser = Browser()
+                break
+            except Exception as e:
+                log(f"[W{wid}] Chrome start failed ({attempt + 1}/3): "
+                    f"{type(e).__name__}: {e}")
+                time.sleep(5 * (attempt + 1))
+        if browser is None:
+            with lock:
+                stats["error"] += len(chunk)
+            return
         local = []
         try:
             for cat in chunk:
@@ -515,6 +556,16 @@ def main():
         log(f"FAIL: {stats['error']} categories errored out of {len(cats)}")
         return 1
     return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        log(f"FATAL: {type(e).__name__}: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
