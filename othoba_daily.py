@@ -116,18 +116,25 @@ def fetch_static(url, max_attempts=3):
     return 0, "", UNKNOWN
 
 
-PRICE_READY_JS = """
-var e = document.querySelectorAll('ins[id^="price_"]');
-if (e.length === 0) return false;
-for (var i = 0; i < e.length; i++) {
-    if (e[i].textContent.trim().length > 0) return true;
+# Since early Nov 2026 Othoba loads the product grid by JavaScript (a spinner
+# sits where the cards used to be) and fills cards in as you scroll. The old
+# wait treated "no cards yet" as "no products", so it grabbed the page before
+# the grid arrived and saw 0-5 items. Now we poll this state instead.
+STATE_JS = """
+var cards = document.querySelectorAll('div.product-details').length;
+var priced = 0;
+var ins = document.querySelectorAll('ins[id^="price_"]');
+for (var i = 0; i < ins.length; i++) {
+    if (ins[i].textContent.trim().length > 0) priced++;
 }
-return false;
+var txt = document.body ? document.body.innerText.toLowerCase() : '';
+return [cards, priced, txt.indexOf('no products were found') >= 0,
+        document.documentElement.scrollHeight];
 """
 
-NO_PRODUCTS_JS = """
-return document.querySelectorAll('div.product-details').length === 0;
-"""
+SCROLL_STEP_JS = "window.scrollBy(0, Math.max(400, window.innerHeight - 100));" \
+                 "return window.innerHeight + window.scrollY >= " \
+                 "document.documentElement.scrollHeight - 5;"
 
 
 def make_driver():
@@ -167,18 +174,60 @@ class Browser:
                     self._restart()
                 self.driver.get(url)
                 self.pages += 1
-                try:
-                    WebDriverWait(self.driver, PAGE_WAIT).until(
-                        lambda d: d.execute_script(PRICE_READY_JS)
-                        or d.execute_script(NO_PRODUCTS_JS))
-                except Exception:
-                    pass
+                self._settle()
                 html = self.driver.page_source
                 return 200, html, classify(200, html)
             except Exception:
                 self._restart()
                 time.sleep(2 * (attempt + 1))
         return 0, "", UNKNOWN
+
+    def _state(self):
+        try:
+            return self.driver.execute_script(STATE_JS)
+        except Exception:
+            return [0, 0, False, 0]
+
+    def _settle(self):
+        """Wait for the JS grid, scroll until no more cards appear, then wait
+        for the prices of the loaded cards to fill in."""
+        d = self.driver
+        # 1. grid arrives (a priced card) or the site says the list is empty
+        end = time.time() + PAGE_WAIT
+        while time.time() < end:
+            cards, priced, empty, _h = self._state()
+            if priced > 0 or empty:
+                break
+            time.sleep(0.5)
+        else:
+            return                              # nothing loaded: caller sees UNKNOWN
+        if empty and cards == 0:
+            return
+
+        # 2. scroll down in viewport steps to trigger lazy loading; stop once
+        #    the card count and page height stay unchanged for 3 rounds
+        last, stable = None, 0
+        end = time.time() + max(PAGE_WAIT, 60)
+        while time.time() < end and stable < 3:
+            try:
+                at_bottom = d.execute_script(SCROLL_STEP_JS)
+            except Exception:
+                break
+            time.sleep(0.4)
+            if not at_bottom:
+                continue
+            time.sleep(0.8)
+            cards, priced, _e, height = self._state()
+            stable = stable + 1 if (cards, height) == last else 0
+            last = (cards, height)
+
+        # 3. prices for (nearly) every loaded card
+        end = time.time() + 15
+        while time.time() < end:
+            cards, priced, _e, _h = self._state()
+            if cards and priced >= cards * 0.98:
+                break
+            time.sleep(0.5)
 
     def close(self):
         try:
@@ -395,13 +444,37 @@ def discover_categories():
 
 
 # --------------------------------------------------------------------------- scrape
+_debug_dumped = set()
+
+
+def _dump_debug(slug, html, verdict):
+    """When a page does not parse, log what it looked like and keep a copy
+    (first 3 only) in debug/, which the workflow uploads as an artifact."""
+    with lock:
+        if len(_debug_dumped) >= 3 or slug in _debug_dumped:
+            return
+        _debug_dumped.add(slug)
+    soup = BeautifulSoup(html or "", "lxml")
+    title = soup.title.get_text(strip=True) if soup.title else None
+    body = (soup.get_text(" ", strip=True) or "")[:200]
+    log(f"DEBUG {slug}: verdict={verdict} html_len={len(html or '')} "
+        f"title={title!r} product-details={'product-details' in (html or '')} "
+        f"price_ids={len(soup.select('[id^=price_]'))} text={body!r}")
+    try:
+        os.makedirs("debug", exist_ok=True)
+        with open(os.path.join("debug", f"{slug}.html"), "w", encoding="utf-8") as f:
+            f.write(html or "")
+    except OSError:
+        pass
+
+
 def scrape_category(browser, cat, page_size, max_pages=None):
     slug = cat["slug"]
     rows, seen = [], set()
     page, expected_pages = 1, None
 
     first_url = f"{BASE}/{slug}?pagenumber=1" + (f"&pagesize={page_size}" if page_size else "")
-    _s, _h, _v = fetch_static(first_url)
+    _s, _h, _v = fetch_static(first_url, max_attempts=1)
     if _v == GONE:
         return [], GONE, 0
     _f, _l, total = parse_total(_h)
@@ -422,9 +495,20 @@ def scrape_category(browser, cat, page_size, max_pages=None):
         if verdict == GONE:
             return rows, (GONE if page == 1 else OK), page - 1
         if verdict not in (OK, EMPTY):
+            if page == 1:
+                _dump_debug(slug, html, verdict)
             return rows, (verdict if page == 1 else OK), page - 1
 
+        if page == 1 and expected_pages is None and page_size:
+            # the counter is no longer in the static HTML; try the rendered page
+            _f, _l, t = parse_total(html)
+            if t:
+                expected_pages = max(1, -(-t // page_size))
+
         page_rows = parse_products(html, slug)
+        if page == 1 and verdict == OK and not page_rows:
+            # Cards are on the page but none parsed: markup has changed
+            _dump_debug(slug, html, "ok-but-0-parsed")
         new = [r for r in page_rows if r["Product ID"] not in seen]
         seen.update(r["Product ID"] for r in new)
         rows.extend(new)
@@ -465,7 +549,7 @@ def main():
     # Size the run so the biggest categories start first
     for c in cats:
         u = f"{BASE}/{c['slug']}?pagenumber=1&pagesize={PAGE_SIZE}"
-        _s, _h, _v = fetch_static(u)
+        _s, _h, _v = fetch_static(u, max_attempts=1)   # often 0 now; only for ordering
         _f, _l, t = parse_total(_h) if _v == OK else (None, None, None)
         c["products"] = t or 0
     cats.sort(key=lambda c: -c["products"])
@@ -519,7 +603,9 @@ def main():
             f.result()
 
     if not all_rows:
-        log("FATAL: no rows collected")
+        log(f"FATAL: no rows collected from {len(cats)} categories "
+            f"(ok={stats['ok']} empty={stats['empty']} gone={stats['gone']} "
+            f"error={stats['error']}) - see DEBUG lines above")
         return 1
 
     df = pd.DataFrame(all_rows)
@@ -566,7 +652,3 @@ if __name__ == "__main__":
         traceback.print_exc()
         log(f"FATAL: {type(e).__name__}: {e}")
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
