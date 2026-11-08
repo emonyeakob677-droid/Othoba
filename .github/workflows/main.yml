@@ -82,7 +82,7 @@ jobs:
       # Artifacts expire, so the repo remains the system of record.
       - name: Upload artifact
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: othoba-csv
           path: |
