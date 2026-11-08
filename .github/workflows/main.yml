@@ -56,7 +56,22 @@ jobs:
           fi
           echo "::warning::First scrape attempt failed; retrying in 5 minutes"
           sleep 300
-          python othoba_daily.py 2>&1 | tee -a scrape.log
+          if python othoba_daily.py 2>&1 | tee -a scrape.log; then
+            exit 0
+          fi
+
+          # Surface the scraper's own last lines as the error annotation and on
+          # the run summary page, so the reason is visible without opening logs.
+          tail_txt=$(tail -n 40 scrape.log)
+          {
+            echo "### Scrape failed — last 40 lines of scrape.log"
+            echo '```'
+            echo "$tail_txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          esc=$(printf '%s' "$tail_txt" | sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/\n/%0A/g' -e 's/\r/%0D/g')
+          echo "::error title=Scrape failed::${esc}"
+          exit 1
 
       - name: Commit the day's data
         if: success()
@@ -88,5 +103,6 @@ jobs:
           path: |
             data/*.csv
             scrape.log
+            debug/
           retention-days: 30
           if-no-files-found: warn
