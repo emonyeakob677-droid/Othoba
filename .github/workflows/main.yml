@@ -18,13 +18,17 @@ concurrency:
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    # Pinned instead of ubuntu-latest: ubuntu-latest is being migrated to
+    # Ubuntu 26 (from 2026-10-19), and this job relies on the preinstalled
+    # Chrome + Python 3.11 of the 24.04 image it has always run on.
+    runs-on: ubuntu-24.04
     timeout-minutes: 330    # GitHub's hard ceiling is 360
 
     steps:
-      - uses: actions/checkout@v4
+      # Node 24 versions of the actions (the @v4/@v5 ones were Node 20)
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
@@ -33,9 +37,10 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Show Chrome version
-        run: google-chrome --version
+        run: google-chrome --version || echo "google-chrome not on PATH; Selenium Manager will download Chrome"
 
       - name: Scrape
+        shell: bash          # explicit bash => pipefail, so tee does not hide a failure
         env:
           FOOD_ONLY: '1'
           SCOPE: leaf
@@ -43,7 +48,15 @@ jobs:
           PAGE_SIZE: '80'
           MIN_ROWS: '300'
           OUT_DIR: data
-        run: python othoba_daily.py
+        run: |
+          # One retry: a missing day can never be back-filled, and most
+          # failures (site hiccup, Chrome crash, temporary block) are transient.
+          if python othoba_daily.py 2>&1 | tee scrape.log; then
+            exit 0
+          fi
+          echo "::warning::First scrape attempt failed; retrying in 5 minutes"
+          sleep 300
+          python othoba_daily.py 2>&1 | tee -a scrape.log
 
       - name: Commit the day's data
         if: success()
@@ -53,18 +66,27 @@ jobs:
           git add data/
           if git diff --staged --quiet; then
             echo "No new data to commit."
-          else
-            git commit -m "data: othoba $(TZ=Asia/Dhaka date +%F)"
-            git push
+            exit 0
           fi
+          git commit -m "data: othoba $(TZ=Asia/Dhaka date +%F)"
+          # The scrape takes hours; if anything was pushed meanwhile, a plain
+          # push is rejected. Rebase onto the latest main and retry.
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            echo "push attempt $i failed; retrying"
+            sleep $((i * 10))
+          done
+          exit 1
 
       # A second copy, in case a push ever fails or the repo is rewritten.
       # Artifacts expire, so the repo remains the system of record.
       - name: Upload artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: othoba-csv
-          path: data/*.csv
+          path: |
+            data/*.csv
+            scrape.log
           retention-days: 30
           if-no-files-found: warn
